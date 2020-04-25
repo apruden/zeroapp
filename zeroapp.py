@@ -3,7 +3,9 @@ import json, flask.json, datetime
 import itertools
 import pprint as pp
 
+from collections import namedtuple
 from flask_sqlalchemy import SQLAlchemy, BaseQuery
+import sqlalchemy
 from sqlalchemy import and_, or_
 from sqlalchemy.ext.declarative import DeclarativeMeta
 from sqlalchemy.ext.declarative import declared_attr
@@ -14,6 +16,8 @@ from alchemyjsonschema import SchemaFactory
 from alchemyjsonschema import ForeignKeyWalker
 
 from fiql_parser import parse_str_to_expression
+
+import sqlalchemy.sql.sqltypes as sqltypes
 
 
 class AlchemyEncoder(json.JSONEncoder):
@@ -63,6 +67,7 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ECHO'] = True
 
 db = SQLAlchemy(app)
+schema_factory = SchemaFactory(ForeignKeyWalker)
 
 
 class CustomColumn(db.Column):
@@ -77,9 +82,20 @@ class CustomColumn(db.Column):
         return c
 
 
+FormEntry = namedtuple('FormEntry', ['field', 'type'])
+
+
 class Authentication:
     def validate(self):
         pass
+
+    @classmethod
+    def form(c):
+        return [getattr(c, n) for n in dir(c) if isinstance(getattr(c, n), sqlalchemy.orm.attributes.InstrumentedAttribute)]
+
+    @classmethod
+    def table(c):
+        return [getattr(c, n) for n in dir(c) if isinstance(getattr(c, n), sqlalchemy.orm.attributes.InstrumentedAttribute)]
 
 
 class User(db.Model, JsonMixin, Authentication):
@@ -106,6 +122,18 @@ class Profile(db.Model, JsonMixin, Authentication):
     def validate(self):
         pass
 
+    @classmethod
+    def form(c):
+        return [c.username, c.gender, c.dob, c.headline, c.about, FormEntry(c.city, 'typeahead_city')]
+
+    @classmethod
+    def table(c):
+        return [c.username, c.gender, c.dob, c.city]
+
+    @classmethod
+    def auth(c):
+        return {c.username: dict(RO='self.id == user.id', RW='self.id == user.id'), '*': dict(RW='True')}
+
 
 class Message(db.Model, JsonMixin, Authentication):
     id = CustomColumn(db.Integer, primary_key=True)
@@ -113,7 +141,6 @@ class Message(db.Model, JsonMixin, Authentication):
     to = CustomColumn(db.Integer)
     fro = CustomColumn(db.Integer)
     read = CustomColumn(db.DateTime)
-
 
 
 _ops = {
@@ -150,10 +177,40 @@ def build_criteria(e, exp):
         raise Exception('invalid expression')
 
 
-@app.route('/api/<entity>/_schema', methods=['GET'])
+_form_map = {
+        sqltypes.Integer: 'number',
+        sqltypes.Date: 'date',
+        sqltypes.DateTime: 'dateTime',
+        sqltypes.Float: 'number',
+        sqltypes.String: 'text',
+        sqltypes.Text: 'text'
+        }
+
+
+def dict_merge(a, b):
+    a.update(b)
+    return a
+
+
+def form_builder(e, entries):
+    names = {getattr(e, n): n for n in dir(e) if not n.startswith('_')}
+    extended = [e if isinstance(e, FormEntry) else FormEntry(e, _form_map[e.type.__class__]) for e in entries]
+    return [dict(key=names[e.field], type=e.type) for e in extended]
+
+
+@app.route('/api/<entity>/_schema_form', methods=['GET'])
 def get_schema(entity):
-    factory = SchemaFactory(ForeignKeyWalker)
-    return dumps(factory(_entities[entity]))
+    e = _entities[entity]
+    schema = schema_factory(e)
+    form = form_builder(e, e.form())
+    table = form_builder(e, e.table())
+
+    return dumps(dict(schema=schema, form=form, table=table))
+
+
+def ro_auth(cls, entities=None, include='*', exclude=None):
+    names = cls.auth.keys()
+
 
 
 @app.route('/api/<entity>', methods=['GET', 'POST', 'PUT', 'DELETE'])
@@ -189,18 +246,21 @@ def do_entities(entity):
         res.headers['X-Total-Count'] = count
 
         return res
+
     elif request.method == 'POST': # POST
         obj = e(**request.json)
         db.session.add(obj)
         db.session.commit()
 
         return dumps(obj)
+
     elif request.method == 'PUT':
         updates = {getattr(e, k): v for k, v in request.json.items()}
         e.query.filter(getattr(e, 'id').in_(request.args['ids'])).update(updates)
         db.session.commit()
 
         return 'OK'
+
     else: #DELETE
         e.query.filter(getattr(e, 'id').in_(request.args['ids'])).delete()
         db.session.commit()
