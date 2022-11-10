@@ -18,7 +18,7 @@
     "vue-form-generator": "^2.0.0",
     "vue-i18n": "^7.3.0",
     "vue-router": "^2.7.0",
-    "vue-socket.io": "^2.1.1-a",
+    "vue-socket.io": "^3.0.10",
     "vue-tables-2": "^0.6.77"
   },
   "devDependencies": {
